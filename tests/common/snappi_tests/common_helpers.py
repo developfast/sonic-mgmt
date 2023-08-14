@@ -853,13 +853,11 @@ class packet_capture(Enum):
 def config_capture_pkt(testbed_config, port_id, capture_type, capture_name=None):
     """
     Generate the configuration to capture packets on a port for a specific type of packet
-
     Args:
         testbed_config (obj): L2/L3 snappi config of a testbed
         port_id (int): ID of DUT port to capture packets
         capture_type (Enum): Type of packet to capture
         capture_name (str): Name of the capture
-
     Returns:
         N/A
     """
