@@ -351,6 +351,7 @@ def load_pg_profile_lookup(path, threshold_field):
                 continue
             tokens = stripped.split()
             if len(tokens) < 6:
+                _log("Warning: skipping malformed pg_profile_lookup line: {}".format(stripped))
                 continue
             speed, cable = tokens[0], tokens[1]
             size, xon, xoff, threshold = tokens[2:6]
