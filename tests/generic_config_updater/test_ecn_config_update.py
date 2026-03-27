@@ -143,10 +143,10 @@ def get_wred_profiles(duthost, cli_namespace_prefix):
 # Determines how the value of each field should change to satisfy different constraints (explained below).
 def determine_delta_values(ecn_data, fields):
     # Extra care should be taken when changing "green_min_threshold" and "green_max_threshold". "green_min_threshold"
-    # must always be less than or equal to "green_max_threshold". Also, "green_max_threshold" must be less than the available
-    # buffer pool size. Note that some platforms (e.g., Mellanox) round-up the value of "green_max_threshold" if
-    # it is not provided as a multiple of a certain number in the config. The rounded-up value must still be
-    # less than the buffer pool size. So to avoid potential issues, we never attempt to increase
+    # must always be less than or equal to "green_max_threshold". Also, "green_max_threshold" must be less than
+    # the available buffer pool size. Note that some platforms (e.g., Mellanox) round-up the value of
+    # "green_max_threshold" if it is not provided as a multiple of a certain number in the config. The rounded-up
+    # value must still be less than the buffer pool size. So to avoid potential issues, we never attempt to increase
     # "green_max_threshold".
     delta = {"green_min_threshold": 0, "green_max_threshold": 0, "green_drop_probability": 0}
 
