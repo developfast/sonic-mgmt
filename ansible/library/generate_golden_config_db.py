@@ -9,6 +9,7 @@ import copy
 from jinja2 import Template
 import logging
 import json
+import os
 import re
 import ipaddress
 
@@ -52,10 +53,129 @@ def is_full_lossy_hwsku(hwsku):
     return hwsku in LOSSY_HWSKU
 
 
+def find_matching_breakout_mode(breakout_modes, num_ports, speed_mbps):
+    """Find matching breakout mode in platform.json's breakout_modes dict.
+
+    Returns (bmode_key, aliases_list) or (None, None) if no match found.
+    """
+    speed_g = speed_mbps // 1000
+    for bmode_key, bmode_aliases in breakout_modes.items():
+        bmode_clean = re.sub(r'\[.*\]', '', bmode_key)
+        m = re.match(r'(\d+)x(\d+)G', bmode_clean)
+        if not m or int(m.group(1)) != num_ports:
+            continue
+        default_speed_g = int(m.group(2))
+        if default_speed_g == speed_g:
+            return bmode_key, bmode_aliases
+        bracket_match = re.search(r'\[(.*?)\]', bmode_key)
+        if bracket_match:
+            supported = [int(s.strip().replace('G', '')) for s in bracket_match.group(1).split(',')]
+            if speed_g in supported:
+                return bmode_key, bmode_aliases
+    return None, None
+
+
+def generate_port_table_from_platform(port_speeds, platform_json_path):
+    """Generate a PORT table from port names/speeds + platform.json.
+
+    For each physical cage in platform.json, finds which ports from port_speeds
+    belong to it, determines the breakout mode, and generates PORT entries with
+    correct lanes, aliases, indices, speed, and FEC.
+
+    Args:
+        port_speeds: dict of {port_name: speed_str} from minigraph
+        platform_json_path: path to platform.json on the DUT
+
+    Returns:
+        dict of PORT table entries, or None on failure
+    """
+    if not os.path.isfile(platform_json_path):
+        return None
+
+    with open(platform_json_path) as f:
+        platform_data = json.load(f)
+
+    if 'interfaces' not in platform_data:
+        return None
+
+    plat_intfs = platform_data['interfaces']
+    port_table = {}
+
+    for cage_name in sorted(plat_intfs.keys(), key=lambda x: int(x.replace('Ethernet', ''))):
+        cage_info = plat_intfs[cage_name]
+        cage_base = int(cage_name.replace('Ethernet', ''))
+        lane_str = cage_info.get('lanes', '')
+        lane_list = [l.strip() for l in lane_str.split(',') if l.strip()]
+        total_lanes = len(lane_list)
+        if total_lanes == 0:
+            continue
+
+        index_str = cage_info.get('index', '')
+        index_list = [i.strip() for i in index_str.split(',') if i.strip()]
+        breakout_modes = cage_info.get('breakout_modes', {})
+
+        # Find which ports from port_speeds belong to this cage
+        ports_in_cage = {}
+        for pname, pspeed in port_speeds.items():
+            if not pname.startswith('Ethernet') or not pname[8:].isdigit():
+                continue
+            pnum = int(pname[8:])
+            if cage_base <= pnum < cage_base + total_lanes:
+                ports_in_cage[pname] = int(pspeed)
+
+        if not ports_in_cage:
+            continue
+
+        num_ports = len(ports_in_cage)
+        speed_mbps = list(ports_in_cage.values())[0]
+
+        # Find matching breakout mode for alias resolution
+        _, aliases = find_matching_breakout_mode(breakout_modes, num_ports, speed_mbps)
+
+        # Fallback alias generation
+        if aliases is None:
+            cage_idx = index_list[0] if index_list else str(cage_base // total_lanes + 1)
+            if num_ports == 1:
+                aliases = ['etp{}'.format(cage_idx)]
+            else:
+                aliases = ['etp{}{}'.format(cage_idx, chr(ord('a') + i)) for i in range(num_ports)]
+
+        # Generate PORT entries
+        lanes_per_port = total_lanes // num_ports
+        sorted_port_names = sorted(ports_in_cage.keys(), key=lambda x: int(x[8:]))
+
+        for sub_idx, port_name in enumerate(sorted_port_names):
+            start_lane = sub_idx * lanes_per_port
+            end_lane = start_lane + lanes_per_port
+            sub_lanes = ','.join(lane_list[start_lane:end_lane])
+
+            alias = aliases[sub_idx] if sub_idx < len(aliases) else port_name
+            index = index_list[start_lane] if start_lane < len(index_list) else '1'
+
+            port_entry = {
+                'alias': alias,
+                'lanes': sub_lanes,
+                'speed': str(speed_mbps),
+                'index': index,
+                'admin_status': 'up',
+                'mtu': '9100',
+                'tpid': '0x8100',
+                'pfc_asym': 'off'
+            }
+
+            if speed_mbps >= 200000:
+                port_entry['fec'] = 'rs'
+
+            port_table[port_name] = port_entry
+
+    return port_table
+
+
 class GenerateGoldenConfigDBModule(object):
     def __init__(self):
         self.module = AnsibleModule(argument_spec=dict(topo_name=dict(required=True, type='str'),
                                     port_index_map=dict(required=False, type='dict', default=None),
+                                    port_speeds=dict(required=False, type='dict', default=None),
                                     macsec_profile=dict(required=False, type='str', default=None),
                                     num_asics=dict(required=False, type='int', default=1),
                                     hwsku=dict(required=False, type='str', default=None),
@@ -68,10 +188,14 @@ class GenerateGoldenConfigDBModule(object):
                                     supports_check_mode=True)
         self.topo_name = self.module.params['topo_name']
         self.port_index_map = self.module.params['port_index_map']
+        self.port_speeds = self.module.params['port_speeds']
         self.macsec_profile = self.module.params['macsec_profile']
         self.num_asics = self.module.params['num_asics']
         self.hwsku = self.module.params['hwsku']
-        self.platform, _ = device_info.get_platform_and_hwsku()
+        self.platform, dut_hwsku = device_info.get_platform_and_hwsku()
+        # Use DUT's own hwsku as fallback when playbook doesn't provide one
+        if not self.hwsku and dut_hwsku:
+            self.hwsku = dut_hwsku
 
         self.vm_configuration = self.module.params['vm_configuration']
         self.is_lit_mode = self.module.params['is_lit_mode']
@@ -820,21 +944,41 @@ class GenerateGoldenConfigDBModule(object):
 
     def generate_lt2_ft2_golden_config_db(self):
         """
-        Generate golden_config for FT2 to enable FEC.
-        **Only PORT table is updated**.
+        Generate golden_config for FT2/LT2 topologies.
+
+        Rebuilds the PORT table from platform.json to get correct lanes, aliases,
+        and indices for the current breakout mode. Falls back to minigraph PORT
+        with FEC added if platform.json is not available.
         """
         SUPPORTED_TOPO = ["ft2-64", "lt2-p32o64", "lt2-o128"]
         if self.topo_name not in SUPPORTED_TOPO:
             return "{}"
-        SUPPORTED_PORT_SPEED = ["200000", "400000", "800000"]
+
         ori_config = json.loads(self.get_config_from_minigraph())
-        port_config = ori_config.get("PORT", {})
-        for name, config in port_config.items():
-            # Enable FEC for ports with supported speed
+        minigraph_ports = ori_config.get("PORT", {})
+
+        # Try to rebuild PORT from platform.json for correct lanes/aliases.
+        # Prefer links.csv port speeds (self.port_speeds) over minigraph ports,
+        # because links.csv reflects the desired breakout layout after an HWSKU
+        # change, while minigraph may still have the old port count/speeds.
+        platform_json_path = os.path.join(
+            '/usr/share/sonic/device', self.platform, 'platform.json')
+        if self.port_speeds:
+            port_speeds = {name: str(speed) for name, speed in self.port_speeds.items()}
+        else:
+            port_speeds = {name: cfg.get("speed", "0") for name, cfg in minigraph_ports.items()}
+
+        port_table = generate_port_table_from_platform(port_speeds, platform_json_path)
+        if port_table:
+            return json.dumps({"PORT": port_table}, indent=4)
+
+        # Fallback: use minigraph PORT with FEC added for high-speed ports
+        SUPPORTED_PORT_SPEED = ["200000", "400000", "800000"]
+        for name, config in minigraph_ports.items():
             if config["speed"] in SUPPORTED_PORT_SPEED and "fec" not in config:
                 config["fec"] = "rs"
 
-        return json.dumps({"PORT": port_config}, indent=4)
+        return json.dumps({"PORT": minigraph_ports}, indent=4)
 
     def generate_t0_f2_golden_config_db(self):
         """
@@ -951,6 +1095,27 @@ class GenerateGoldenConfigDBModule(object):
                     "has_per_asic_scope": "True",
                 }
             })
+
+        # Ensure DEVICE_METADATA always includes hwsku — config override-config-table
+        # replaces the entire table, so missing fields (like hwsku) get wiped on the DUT
+        config_dict = json.loads(config)
+        if "DEVICE_METADATA" not in config_dict:
+            config_dict["DEVICE_METADATA"] = {}
+        if "localhost" not in config_dict["DEVICE_METADATA"]:
+            config_dict["DEVICE_METADATA"]["localhost"] = {}
+        dm = config_dict["DEVICE_METADATA"]["localhost"]
+        if not dm.get("hwsku"):
+            hwsku = self.hwsku
+            if not hwsku:
+                rc, out, _ = self.module.run_command(
+                    "sonic-cfggen -d -v 'DEVICE_METADATA[\"localhost\"][\"hwsku\"]'")
+                if rc == 0 and out.strip():
+                    hwsku = out.strip()
+            if hwsku:
+                dm["hwsku"] = hwsku
+        if not dm.get("platform") and self.platform:
+            dm["platform"] = self.platform
+        config = json.dumps(config_dict, indent=4)
 
         with open(GOLDEN_CONFIG_DB_PATH, "w") as temp_file:
             temp_file.write(config)
