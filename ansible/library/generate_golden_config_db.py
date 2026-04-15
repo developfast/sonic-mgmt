@@ -16,6 +16,9 @@ import ipaddress
 from ansible.module_utils.basic import AnsibleModule
 from sonic_py_common import device_info, multi_asic
 from ansible.module_utils.smartswitch_utils import smartswitch_hwsku_config, smartswitch_vlan_config
+from buffer_config_helper import generate_all_buffer_tables
+from get_ports2cable import (normalize_role, resolve_port_cable_lengths,
+                             resolve_ports2cable_dict)
 
 DOCUMENTATION = '''
 module: generate_golden_config_db.py
@@ -181,10 +184,15 @@ class GenerateGoldenConfigDBModule(object):
                                     hwsku=dict(required=False, type='str', default=None),
                                     vm_configuration=dict(required=False, type='dict', default={}),
                                     is_lit_mode=dict(required=False, type='bool', default=True),
+                                    bgp_confd_asn=dict(required=False, type='str', default=None),
+                                    bgp_confd_peers=dict(required=False, type='str', default=None),
                                     npu_index=dict(required=False, type='int', default=0),
                                     duts_list=dict(required=False, type='list', default=[]),
                                     dut_loopbacks=dict(required=False, type='dict', default={}),
-                                    console_ports=dict(required=False, type='dict', default=None)),
+                                    console_ports=dict(required=False, type='dict', default=None),
+                                    cable_length=dict(required=False, type='str', default='40m'),
+                                    buffer_gen=dict(required=False, type='bool', default=False),
+                                    neighbor_data=dict(required=False, type='dict', default=None)),
                                     supports_check_mode=True)
         self.topo_name = self.module.params['topo_name']
         self.port_index_map = self.module.params['port_index_map']
@@ -203,6 +211,9 @@ class GenerateGoldenConfigDBModule(object):
         self.duts_list = self.module.params['duts_list']
         self.dut_loopbacks = self.module.params['dut_loopbacks']
         self.console_ports = self.module.params['console_ports']
+        self.cable_length = self.module.params['cable_length']
+        self.buffer_gen = self.module.params['buffer_gen']
+        self.neighbor_data = self.module.params['neighbor_data']
 
     def generate_mgfx_golden_config_db(self):
         rc, out, err = self.module.run_command("sonic-cfggen -H -m -j /etc/sonic/init_cfg.json --print-data")
@@ -942,6 +953,44 @@ class GenerateGoldenConfigDBModule(object):
         ori_config_db["DEVICE_METADATA"]["localhost"]["zebra_nexthop"] = zebra_nexthop
         return json.dumps(ori_config_db, indent=4)
 
+    def _resolve_cable_lengths(self, port_table, ori_config):
+        """Resolve per-port cable lengths from neighbor data and ports2cable.
+
+        Uses neighbor_data (passed from playbook) if available, otherwise
+        falls back to DEVICE_NEIGHBOR from the minigraph config. Resolves
+        the ports2cable mapping from the platform-specific defaults file
+        or hardcoded defaults.
+
+        Returns:
+            dict of port_name -> cable_length_string
+        """
+        device_metadata = ori_config.get("DEVICE_METADATA", {})
+        my_role_raw = device_metadata.get("localhost", {}).get("type", "")
+        my_role = normalize_role(my_role_raw)
+
+        ports2cable = resolve_ports2cable_dict(
+            self.platform, self.hwsku, device_metadata)
+
+        # Build per-port neighbor type mapping
+        neighbor_types = {}
+        if self.neighbor_data:
+            # neighbor_data passed directly from playbook: port -> neighbor_type
+            neighbor_types = self.neighbor_data
+        else:
+            # Fall back to minigraph DEVICE_NEIGHBOR + DEVICE_NEIGHBOR_METADATA
+            device_neighbor = ori_config.get("DEVICE_NEIGHBOR", {})
+            device_neighbor_meta = ori_config.get("DEVICE_NEIGHBOR_METADATA", {})
+            for port_name in port_table:
+                neighbor_entry = device_neighbor.get(port_name, {})
+                neighbor_name = neighbor_entry.get("name")
+                if neighbor_name and neighbor_name in device_neighbor_meta:
+                    neighbor_types[port_name] = device_neighbor_meta[
+                        neighbor_name].get("type", "")
+
+        return resolve_port_cable_lengths(
+            list(port_table.keys()), neighbor_types, ports2cable,
+            my_role, self.cable_length)
+
     def generate_lt2_ft2_golden_config_db(self):
         """
         Generate golden_config for FT2/LT2 topologies.
@@ -949,6 +998,9 @@ class GenerateGoldenConfigDBModule(object):
         Rebuilds the PORT table from platform.json to get correct lanes, aliases,
         and indices for the current breakout mode. Falls back to minigraph PORT
         with FEC added if platform.json is not available.
+
+        When buffer_gen is enabled, includes all buffer and QoS tables with
+        per-port cable lengths resolved from neighbor data.
         """
         SUPPORTED_TOPO = ["ft2-64", "lt2-p32o64", "lt2-o128"]
         if self.topo_name not in SUPPORTED_TOPO:
@@ -970,7 +1022,14 @@ class GenerateGoldenConfigDBModule(object):
 
         port_table = generate_port_table_from_platform(port_speeds, platform_json_path)
         if port_table:
-            return json.dumps({"PORT": port_table}, indent=4)
+            golden_config = {"PORT": port_table}
+            if self.buffer_gen:
+                port_cable_lengths = self._resolve_cable_lengths(
+                    port_table, ori_config)
+                golden_config.update(generate_all_buffer_tables(
+                    port_table, self.cable_length,
+                    port_cable_lengths=port_cable_lengths))
+            return json.dumps(golden_config, indent=4)
 
         # Fallback: use minigraph PORT with FEC added for high-speed ports
         SUPPORTED_PORT_SPEED = ["200000", "400000", "800000"]
@@ -978,7 +1037,14 @@ class GenerateGoldenConfigDBModule(object):
             if config["speed"] in SUPPORTED_PORT_SPEED and "fec" not in config:
                 config["fec"] = "rs"
 
-        return json.dumps({"PORT": minigraph_ports}, indent=4)
+        golden_config = {"PORT": minigraph_ports}
+        if self.buffer_gen:
+            port_cable_lengths = self._resolve_cable_lengths(
+                minigraph_ports, ori_config)
+            golden_config.update(generate_all_buffer_tables(
+                minigraph_ports, self.cable_length,
+                port_cable_lengths=port_cable_lengths))
+        return json.dumps(golden_config, indent=4)
 
     def generate_t0_f2_golden_config_db(self):
         """

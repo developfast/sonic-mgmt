@@ -884,6 +884,9 @@
           duts_list: "{{ testbed_facts['duts'] | default([]) }}"
           dut_loopbacks: "{{ topology.DUT.loopback | default({}) }}"
           console_ports: "{{ device_serial_link[inventory_hostname] | default(omit) if 'c0' in topo else omit }}"
+          cable_length: "{{ breakout_default_cable_length | default('40m') }}"
+          buffer_gen: "{{ buffer_gen | default(false) | bool }}"
+          neighbor_data: "{{ neighbor_data | default(omit) }}"
         become: true
 
       - name: Copy macsec profile json to dut
